@@ -293,3 +293,79 @@ Yorum "izinliyse 0, değilse -1" diyor ama aralık dışı durum `1` döndürüy
    - **Kontrol/kestirim:** AM fix'in yazılımsal AGC'si, histerezisli ve sabit eşikli. RSSI üzerinde basit bir filtre/gözlemci ile daha yumuşak kazanç geçişi denenebilir.
    - **Sinyal işleme:** Spektrum analizöründe RSSI ortalama/tepe tutma modları.
    - **Gömülü altyapı:** Host tarafında birim testi iskeleti (frekans/adım hesapları için).
+
+---
+
+## 14. UART CAT Eklentisi (bu fork'a özel)
+
+Telsiz normal modda çalışırken PC'nin programlama kablosu üzerinden telsizi izlemesi ve kontrol etmesi için eklendi. Ses, mikrofon/hoparlör jakları üzerinden analog olarak akmaya devam eder; UART sadece olay ve kontrol taşır.
+
+**Akış:** Sinyal gelince telsiz kendiliğinden `RX_BASLADI` paketi yollar, ses analogdan devam eder. Sinyal bitince `RX_BITTI` gelir; PC bu noktada durum okur, gerekirse frekans değiştirir veya PTT açar.
+
+### Derleme
+
+| Bayrak | Değer | Not |
+|---|---|---|
+| `ENABLE_UART_CAT` | 1 | `ENABLE_UART=1` gerektirir, ~800 bayt flash |
+| `ENABLE_DTMF_CALLING` | **0** | Flash'a sığmak için kapatıldı (2,5 KB). ANI/kill/revive kodlu DTMF çağrı sistemi yok; normal DTMF ton gönderimi etkilenmez |
+
+Boyutlar (`text+data`, sınır 61 440): orijinal 61 336 bayt (104 boş) → CAT'li 59 564 bayt (1 876 boş).
+
+### Protokol
+
+Çerçeve mevcut programlama protokolüyle aynı (Bölüm 9): 38400 baud, `AB CD | uzunluk | obf(yük + CRC16-XMODEM) | DC BA`. Telsizden gelen yanıtta CRC yok, yerinde obfuscation uygulanmış `FF FF` var. Frekanslar 10 Hz biriminde (145,500 MHz = 14 550 000). Tüm alanlar little-endian.
+
+| Yön | ID | Yük | Açıklama |
+|---|---|---|---|
+| PC→T | `0x0701` | — | Durum iste |
+| T→PC | `0x0702` | `u32 rx_f, u32 tx_f, u16 rssi, u16 batarya_10mV, u8 fonksiyon, u8 rx_vfo, u8 tx_vfo, u8 bayrak, u8 gürültü, u8 glitch, u8 kanal, u8 dolgu` | bayrak: b0 RX aktif, b1 CAT PTT, b2 PTT basılı, b3 olaylar açık |
+| PC→T | `0x0703` | `u8 açık, 3×dolgu` | PTT aç/kapat |
+| T→PC | `0x0704` | `u8 sonuç, u8 cat_ptt, u8 fonksiyon, u8 dolgu` | |
+| PC→T | `0x0705` | `u32 frekans` | Seçili VFO'nun frekansını ayarla |
+| T→PC | `0x0706` | `u8 sonuç, 3×dolgu, u32 uygulanan_frekans` | Adıma yuvarlanmış değer döner |
+| T→PC | `0x0710` | `u32 frekans, u16 rssi, u8 gürültü, u8 glitch, u8 fonksiyon, u8 vfo, 2×dolgu` | **RX başladı** (kendiliğinden) |
+| T→PC | `0x0711` | `u32 süre_10ms, u16 tepe_rssi, 2×dolgu` | **RX bitti** (kendiliğinden) |
+
+Sonuç kodları: 0 tamam, 1 VFO modunda değil, 2 meşgul (TX/PTT), 3 RX aralığı dışı, 4 bant değişimi desteklenmiyor, 5 reddedildi.
+
+Paket boyutları firmware'de `static_assert` ile sabitlendi; istemciyle uyumsuz bir değişiklik derlenmez.
+
+### Tasarım kararları ve güvenlik
+
+- **Olaylar isteğe bağlı:** Herhangi bir `0x07xx` komutu olayları açar, `0x0514` (CHIRP el sıkışması) kapatır. CHIRP oturumu kendiliğinden gelen paket görmez.
+- **TX kesilmez:** Programlama komutlarının aksine CAT komutları `gSerialConfigCountDown_500ms`'e dokunmaz, yayın sırasında durum okumak güvenlidir.
+- **PTT watchdog:** CAT PTT 2 saniye içinde yenilenmezse kendiliğinden düşer; PC çökerse veya kablo çıkarsa telsiz yayında kalmaz. Firmware'in kendi TX zaman aşımı da geçerli.
+- **PTT aynı yoldan:** Sanal PTT, `CheckKeys()` içinde donanım PTT'siyle VEYA'lanır (`PTT_IS_RELEASED()`). Debounce, TX frekans izni (`TX_freq_check`), tuş kilidi, tarama iptali gibi tüm mevcut kontroller aynen uygulanır.
+- **Frekans ayarı ertelenir:** Komut işlenirken kesmeler kapalı olduğu için EEPROM yazımı ve register yeniden yapılandırması orada yapılmaz; istek bayrağa yazılır ve `UART_CAT_TimeSlice10ms()` içinde uygulanır.
+- **Kısıtlar:** Frekans ayarı yalnızca VFO (frekans) modunda ve aynı bant içinde çalışır. Her ayar kanal kaydını EEPROM'a yazar (aynı değerse yazmaz); saniyede birçok kez frekans değiştirmek EEPROM ömrünü tüketir.
+- **Spektrum modunda** ana döngü çalışmadığından CAT yanıt vermez.
+
+### PC istemcisi
+
+`tools/uvk5_cat.py` (gereksinim: `pip install pyserial`):
+
+```
+python tools/uvk5_cat.py COM5 listen            # olayları dinle, RX bitince durum oku
+python tools/uvk5_cat.py COM5 listen --poll 5   # boştayken de 5 s'de bir durum
+python tools/uvk5_cat.py COM5 status
+python tools/uvk5_cat.py COM5 freq 145.500
+python tools/uvk5_cat.py COM5 ptt 3             # 3 s TX, watchdog'u kendisi yeniler
+```
+
+Örnek çıktı (temsili değerler):
+
+```
+[02:31:07] RX_BASLADI  frekans=145.50000 MHz  rssi_dbm=-73.5  gurultu=12  glitch=3  vfo=0  fonksiyon=RECEIVE
+[02:31:12] RX_BITTI    sure_s=5.23  tepe_rssi_dbm=-71.0
+[02:31:12] durum       rx=145.50000 MHz  tx=145.50000 MHz  ...
+```
+
+### Donanım notu
+
+UART ve ses aynı K tipi konnektörde. Standart programlama kablosu sadece UART + GND, ses arayüzleri ses + PTT taşır. İkisini aynı anda kullanmak için her iki işlevi taşıyan bir kablo veya ayrıştırıcı gerekir. Hangi kontakların paylaşıldığı ölçülerek doğrulanmalı. PC kontrollü TX için amatör telsiz lisansı ve frekans kuralları geçerlidir.
+
+### Test durumu
+
+- Firmware `-Wall -Wextra -Werror` ile uyarısız derleniyor, paket boyutları `static_assert` ile doğrulandı.
+- İstemcinin çerçeveleme/CRC/obfuscation kodu, firmware'in `SendReply()` ve `UART_IsCommandAvailable()` mantığının Python modeline karşı gidiş-dönüş test edildi (şifreli ve düz mod).
+- **Donanımda denenmedi.** İlk denemede önce `status`, sonra `listen`, en son `ptt` (kukla yükle veya düşük güçte) önerilir.

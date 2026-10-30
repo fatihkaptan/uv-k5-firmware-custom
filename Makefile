@@ -5,6 +5,7 @@
 
 # ---- STOCK QUANSHENG FERATURES ----
 ENABLE_UART                   ?= 1
+ENABLE_UART_CAT               ?= 1
 ENABLE_AIRCOPY                ?= 0
 ENABLE_FMRADIO                ?= 1
 ENABLE_NOAA                   ?= 0
@@ -13,7 +14,8 @@ ENABLE_VOX                    ?= 1
 ENABLE_ALARM                  ?= 0
 ENABLE_TX1750                 ?= 0
 ENABLE_PWRON_PASSWORD         ?= 0
-ENABLE_DTMF_CALLING           ?= 1
+# UART_CAT icin flash acmak uzere kapatildi (+2.5 KB)
+ENABLE_DTMF_CALLING           ?= 0
 ENABLE_FLASHLIGHT             ?= 1
 
 # ---- CUSTOM MODS ----
@@ -268,6 +270,9 @@ ifeq ($(ENABLE_FMRADIO),1)
 endif
 ifeq ($(ENABLE_UART),1)
 	CFLAGS += -DENABLE_UART
+ifeq ($(ENABLE_UART_CAT),1)
+	CFLAGS += -DENABLE_UART_CAT
+endif
 endif
 ifeq ($(ENABLE_BIG_FREQ),1)
 	CFLAGS  += -DENABLE_BIG_FREQ
