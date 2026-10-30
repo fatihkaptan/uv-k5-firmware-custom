@@ -22,5 +22,10 @@
 bool UART_IsCommandAvailable(void);
 void UART_HandleCommand(void);
 
+#ifdef ENABLE_UART_CAT
+extern volatile bool gUartCatPtt;
+void UART_CAT_TimeSlice10ms(void);
+#endif
+
 #endif
 

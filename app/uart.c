@@ -37,6 +37,11 @@
 #include "misc.h"
 #include "settings.h"
 #include "version.h"
+#ifdef ENABLE_UART_CAT
+	#include "frequencies.h"
+	#include "helper/battery.h"
+	#include "radio.h"
+#endif
 
 #if defined(ENABLE_OVERLAY)
 	#include "sram-overlay.h"
@@ -434,6 +439,297 @@ static void CMD_052F(const uint8_t *pBuffer)
 	SendVersion();
 }
 
+#ifdef ENABLE_UART_CAT
+// ---------------------------------------------------------------------------
+// UART CAT: PC control while the radio runs normally.
+//
+//  PC -> radio                       radio -> PC
+//  0x0701 status request             0x0702 status
+//  0x0703 PTT {on}                   0x0704 PTT ack
+//  0x0705 set VFO frequency {f}      0x0706 frequency ack
+//                                    0x0710 RX start event (unsolicited)
+//                                    0x0711 RX end event   (unsolicited)
+//
+// Any 0x07xx command arms the RX events; a 0x0514 (programming hello) disarms
+// them so CHIRP sessions never see unsolicited packets.
+// Frequencies are in 10 Hz units, as everywhere else in the firmware.
+// CAT commands never touch gSerialConfigCountDown_500ms, so they do not
+// inhibit or cut TX like the programming commands do.
+// ---------------------------------------------------------------------------
+
+#define CAT_PTT_TIMEOUT_10ms 200   // PTT drops if not refreshed within 2 s
+
+enum {
+	CAT_OK = 0,
+	CAT_ERR_NOT_VFO,       // selected VFO is a memory channel
+	CAT_ERR_BUSY,          // transmitting / PTT held
+	CAT_ERR_RANGE,         // frequency outside RX range
+	CAT_ERR_BAND,          // band change not supported over CAT
+	CAT_ERR_REJECTED,      // radio refused (reduced service etc.)
+};
+
+typedef struct {
+	Header_t Header;
+	struct {
+		uint32_t RxFrequency;
+		uint32_t TxFrequency;
+		uint16_t RSSI;
+		uint16_t Battery_10mV;
+		uint8_t  Function;
+		uint8_t  RxVfo;
+		uint8_t  TxVfo;
+		uint8_t  Flags;     // b0 RX active, b1 CAT PTT, b2 PTT pressed, b3 events armed
+		uint8_t  Noise;
+		uint8_t  Glitch;
+		uint8_t  Channel;
+		uint8_t  Padding;
+	} Data;
+} REPLY_0702_t;
+
+typedef struct {
+	Header_t Header;
+	uint8_t  On;
+	uint8_t  Padding[3];
+} CMD_0703_t;
+
+typedef struct {
+	Header_t Header;
+	struct {
+		uint8_t Result;
+		uint8_t Ptt;
+		uint8_t Function;
+		uint8_t Padding;
+	} Data;
+} REPLY_0704_t;
+
+typedef struct {
+	Header_t Header;
+	uint32_t Frequency;
+} CMD_0705_t;
+
+typedef struct {
+	Header_t Header;
+	struct {
+		uint8_t  Result;
+		uint8_t  Padding[3];
+		uint32_t Frequency;
+	} Data;
+} REPLY_0706_t;
+
+typedef struct {
+	Header_t Header;
+	struct {
+		uint32_t Frequency;
+		uint16_t RSSI;
+		uint8_t  Noise;
+		uint8_t  Glitch;
+		uint8_t  Function;
+		uint8_t  Vfo;
+		uint8_t  Padding[2];
+	} Data;
+} EVENT_0710_t;
+
+typedef struct {
+	Header_t Header;
+	struct {
+		uint32_t Duration_10ms;
+		uint16_t PeakRSSI;
+		uint8_t  Padding[2];
+	} Data;
+} EVENT_0711_t;
+
+// wire layout is fixed: tools/uvk5_cat.py depends on these sizes
+static_assert(sizeof(REPLY_0702_t) == 4 + 20);
+static_assert(sizeof(CMD_0703_t)   == 4 + 4);
+static_assert(sizeof(REPLY_0704_t) == 4 + 4);
+static_assert(sizeof(CMD_0705_t)   == 4 + 4);
+static_assert(sizeof(REPLY_0706_t) == 4 + 8);
+static_assert(sizeof(EVENT_0710_t) == 4 + 12);
+static_assert(sizeof(EVENT_0711_t) == 4 + 8);
+
+volatile bool gUartCatPtt;
+
+static bool     catArmed;
+static uint8_t  catPttTimer_10ms;
+static bool     catRxActive;
+static uint32_t catRxTime_10ms;
+static uint16_t catRxPeakRssi;
+static bool     catFreqPending;
+static uint32_t catFreqRequest;
+
+static uint16_t CAT_GetRssi(void)
+{
+	return BK4819_ReadRegister(BK4819_REG_67) & 0x01FF;
+}
+
+static void CMD_0701(void)
+{
+	REPLY_0702_t Reply;
+
+	Reply.Header.ID          = 0x0702;
+	Reply.Header.Size        = sizeof(Reply.Data);
+	Reply.Data.RxFrequency   = gRxVfo->pRX->Frequency;
+	Reply.Data.TxFrequency   = gTxVfo->pTX->Frequency;
+	Reply.Data.RSSI          = CAT_GetRssi();
+	Reply.Data.Battery_10mV  = gBatteryVoltageAverage;
+	Reply.Data.Function      = gCurrentFunction;
+	Reply.Data.RxVfo         = gEeprom.RX_VFO;
+	Reply.Data.TxVfo         = gEeprom.TX_VFO;
+	Reply.Data.Flags         = (FUNCTION_IsRx() ? 1u : 0u)
+	                         | (gUartCatPtt     ? 2u : 0u)
+	                         | (gPttIsPressed   ? 4u : 0u)
+	                         | (catArmed        ? 8u : 0u);
+	Reply.Data.Noise         = BK4819_ReadRegister(BK4819_REG_65) & 0x007F;
+	Reply.Data.Glitch        = BK4819_ReadRegister(BK4819_REG_63) & 0x00FF;
+	Reply.Data.Channel       = gTxVfo->CHANNEL_SAVE;
+	Reply.Data.Padding       = 0;
+
+	SendReply(&Reply, sizeof(Reply));
+}
+
+static void CAT_SendPttReply(uint8_t Result)
+{
+	REPLY_0704_t Reply;
+
+	Reply.Header.ID     = 0x0704;
+	Reply.Header.Size   = sizeof(Reply.Data);
+	Reply.Data.Result   = Result;
+	Reply.Data.Ptt      = gUartCatPtt;
+	Reply.Data.Function = gCurrentFunction;
+	Reply.Data.Padding  = 0;
+
+	SendReply(&Reply, sizeof(Reply));
+}
+
+static void CMD_0703(const uint8_t *pBuffer)
+{
+	const CMD_0703_t *pCmd = (const CMD_0703_t *)pBuffer;
+
+	if (pCmd->On && gReducedService) {
+		CAT_SendPttReply(CAT_ERR_REJECTED);
+		return;
+	}
+
+	gUartCatPtt      = pCmd->On != 0;
+	catPttTimer_10ms = gUartCatPtt ? CAT_PTT_TIMEOUT_10ms : 0;
+	CAT_SendPttReply(CAT_OK);
+}
+
+static void CAT_SendFreqReply(uint8_t Result, uint32_t Frequency)
+{
+	REPLY_0706_t Reply;
+
+	memset(&Reply, 0, sizeof(Reply));
+	Reply.Header.ID      = 0x0706;
+	Reply.Header.Size    = sizeof(Reply.Data);
+	Reply.Data.Result    = Result;
+	Reply.Data.Frequency = Frequency;
+
+	SendReply(&Reply, sizeof(Reply));
+}
+
+static void CMD_0705(const uint8_t *pBuffer)
+{
+	const CMD_0705_t *pCmd = (const CMD_0705_t *)pBuffer;
+
+	// applied from UART_CAT_TimeSlice10ms(): EEPROM writes and register
+	// reconfiguration must not run with interrupts disabled
+	catFreqRequest = pCmd->Frequency;
+	catFreqPending = true;
+}
+
+static uint8_t CAT_ApplyFrequency(uint32_t Frequency)
+{
+	if (gCurrentFunction == FUNCTION_TRANSMIT || gUartCatPtt || gPttIsPressed)
+		return CAT_ERR_BUSY;
+
+	if (!IS_FREQ_CHANNEL(gTxVfo->CHANNEL_SAVE))
+		return CAT_ERR_NOT_VFO;
+
+	if (RX_freq_check(Frequency) < 0)
+		return CAT_ERR_RANGE;
+
+	if (FREQUENCY_GetBand(Frequency) != gTxVfo->Band)
+		return CAT_ERR_BAND;
+
+	gTxVfo->freq_config_RX.Frequency = FREQUENCY_RoundToStep(Frequency, gTxVfo->StepFrequency);
+
+	SETTINGS_SaveChannel(gTxVfo->CHANNEL_SAVE, gEeprom.TX_VFO, gTxVfo, 1);
+	RADIO_ConfigureChannel(gEeprom.TX_VFO, VFO_CONFIGURE);
+	RADIO_SelectVfos();
+	RADIO_SetupRegisters(true);
+
+	gUpdateDisplay = true;
+	return CAT_OK;
+}
+
+static void CAT_SendRxStart(void)
+{
+	EVENT_0710_t Event;
+
+	memset(&Event, 0, sizeof(Event));
+	Event.Header.ID      = 0x0710;
+	Event.Header.Size    = sizeof(Event.Data);
+	Event.Data.Frequency = gRxVfo->pRX->Frequency;
+	Event.Data.RSSI      = catRxPeakRssi;
+	Event.Data.Noise     = BK4819_ReadRegister(BK4819_REG_65) & 0x007F;
+	Event.Data.Glitch    = BK4819_ReadRegister(BK4819_REG_63) & 0x00FF;
+	Event.Data.Function  = gCurrentFunction;
+	Event.Data.Vfo       = gEeprom.RX_VFO;
+
+	SendReply(&Event, sizeof(Event));
+}
+
+static void CAT_SendRxEnd(void)
+{
+	EVENT_0711_t Event;
+
+	memset(&Event, 0, sizeof(Event));
+	Event.Header.ID          = 0x0711;
+	Event.Header.Size        = sizeof(Event.Data);
+	Event.Data.Duration_10ms = catRxTime_10ms;
+	Event.Data.PeakRSSI      = catRxPeakRssi;
+
+	SendReply(&Event, sizeof(Event));
+}
+
+void UART_CAT_TimeSlice10ms(void)
+{
+	// PTT watchdog: a crashed or unplugged PC must not leave the radio keyed
+	if (gUartCatPtt && --catPttTimer_10ms == 0)
+		gUartCatPtt = false;
+
+	if (catFreqPending) {
+		catFreqPending = false;
+		const uint8_t Result = CAT_ApplyFrequency(catFreqRequest);
+		CAT_SendFreqReply(Result, gTxVfo->freq_config_RX.Frequency);
+	}
+
+	const bool rxNow = FUNCTION_IsRx();
+
+	if (rxNow) {
+		const uint16_t rssi = CAT_GetRssi();
+
+		if (!catRxActive) {
+			catRxActive    = true;
+			catRxTime_10ms = 0;
+			catRxPeakRssi  = rssi;
+			if (catArmed)
+				CAT_SendRxStart();
+		}
+
+		catRxTime_10ms++;
+		if (rssi > catRxPeakRssi)
+			catRxPeakRssi = rssi;
+	}
+	else if (catRxActive) {
+		catRxActive = false;
+		if (catArmed)
+			CAT_SendRxEnd();
+	}
+}
+#endif
+
 #ifdef ENABLE_UART_RW_BK_REGS
 static void CMD_0601_ReadBK4819Reg(const uint8_t *pBuffer)
 {
@@ -570,6 +866,9 @@ void UART_HandleCommand(void)
 	switch (UART_Command.Header.ID)
 	{
 		case 0x0514:
+#ifdef ENABLE_UART_CAT
+			catArmed = false;   // programming session: no unsolicited packets
+#endif
 			CMD_0514(UART_Command.Buffer);
 			break;
 	
@@ -611,6 +910,23 @@ void UART_HandleCommand(void)
 			#endif
 			break;
 			
+#ifdef ENABLE_UART_CAT
+		case 0x0701:
+			catArmed = true;
+			CMD_0701();
+			break;
+
+		case 0x0703:
+			catArmed = true;
+			CMD_0703(UART_Command.Buffer);
+			break;
+
+		case 0x0705:
+			catArmed = true;
+			CMD_0705(UART_Command.Buffer);
+			break;
+#endif
+
 #ifdef ENABLE_UART_RW_BK_REGS
 		case 0x0601:
 			CMD_0601_ReadBK4819Reg(UART_Command.Buffer);

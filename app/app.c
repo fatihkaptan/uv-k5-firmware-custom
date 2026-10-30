@@ -974,6 +974,13 @@ void APP_Update(void)
 }
 
 // called every 10ms
+// hardware PTT, or the virtual PTT held by the PC over UART CAT
+#ifdef ENABLE_UART_CAT
+	#define PTT_IS_RELEASED() (GPIO_CheckBit(&GPIOC->DATA, GPIOC_PIN_PTT) && !gUartCatPtt)
+#else
+	#define PTT_IS_RELEASED() GPIO_CheckBit(&GPIOC->DATA, GPIOC_PIN_PTT)
+#endif
+
 static void CheckKeys(void)
 {
 #ifdef ENABLE_DTMF_CALLING
@@ -991,7 +998,7 @@ static void CheckKeys(void)
 // -------------------- PTT ------------------------
 	if (gPttIsPressed)
 	{
-		if (GPIO_CheckBit(&GPIOC->DATA, GPIOC_PIN_PTT) || SerialConfigInProgress())
+		if (PTT_IS_RELEASED() || SerialConfigInProgress())
 		{	// PTT released or serial comms config in progress
 			if (++gPttDebounceCounter >= 3 || SerialConfigInProgress())	    // 30ms
 			{	// stop transmitting
@@ -1004,7 +1011,7 @@ static void CheckKeys(void)
 		else
 			gPttDebounceCounter = 0;
 	}
-	else if (!GPIO_CheckBit(&GPIOC->DATA, GPIOC_PIN_PTT) && !SerialConfigInProgress())
+	else if (!PTT_IS_RELEASED() && !SerialConfigInProgress())
 	{	// PTT pressed
 		if (++gPttDebounceCounter >= 3)	    // 30ms
 		{	// start transmitting
@@ -1108,6 +1115,10 @@ void APP_TimeSlice10ms(void)
 		UART_HandleCommand();
 		__enable_irq();
 	}
+#endif
+
+#ifdef ENABLE_UART_CAT
+	UART_CAT_TimeSlice10ms();
 #endif
 
 	if (gReducedService)
